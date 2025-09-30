@@ -1,7 +1,14 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Old-library mode DhanHQ WebSocket Bot — with forced headers + diagnostics
+"""
+
 import os
 import time
 import requests
 import logging
+import traceback
 
 from dhanhq import DhanFeed
 from dhanhq.marketfeed import NSE
@@ -14,7 +21,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 STOCK_ID = '1333'
 STOCK_NAME = "HDFCBANK"
-SEND_INTERVAL_SECONDS = 60
+SEND_INTERVAL_SECONDS = int(os.environ.get("SEND_INTERVAL_SECONDS", "60"))
 
 # --- Basic Setup ---
 instruments = [(NSE, STOCK_ID)]
@@ -24,7 +31,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- 2. Telegram Function ---
 def send_telegram_message(ltp_price):
     global last_telegram_send_time
-    # ... (This function remains the same)
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S IST")
     message = (
         f"🔔 *{STOCK_NAME} LTP ALERT!* 🔔\n\n"
@@ -32,6 +38,9 @@ def send_telegram_message(ltp_price):
         f"**नवीनतम LTP:** ₹ *{ltp_price:.2f}*\n\n"
         f"_हा ॲलर्ट दर {SEND_INTERVAL_SECONDS} सेकंदांनी WebSocket डेटावर आधारित आहे._"
     )
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("Telegram env missing; cannot send alerts.")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
     try:
@@ -43,52 +52,154 @@ def send_telegram_message(ltp_price):
         logging.error(f"Error sending Telegram message: {e}")
 
 # --- 3. WebSocket Callback Functions ---
-def on_connect(instance):
+def on_connect(instance=None):
     logging.info("WebSocket Connected (Old Library Version).")
 
 def on_message(instance, message):
     try:
-        # Assuming old message format
-        if message.get('securityId') == STOCK_ID and message.get('lastTradedPrice'):
-            ltp = message.get('lastTradedPrice')
-            if ltp is not None:
-                current_time = time.time()
-                if current_time - last_telegram_send_time >= SEND_INTERVAL_SECONDS:
-                    send_telegram_message(ltp)
+        # message may be dict or object depending on library version
+        if isinstance(message, dict):
+            sec = message.get('securityId') or message.get('symbol') or message.get('s')
+            ltp = message.get('lastTradedPrice') or message.get('ltp')
+        else:
+            # try attribute access
+            sec = getattr(message, 'securityId', None) or getattr(message, 'symbol', None)
+            ltp = getattr(message, 'lastTradedPrice', None) or getattr(message, 'ltp', None)
+
+        if sec and str(sec) == str(STOCK_ID) and ltp:
+            try:
+                ltp_val = float(ltp)
+            except Exception:
+                return
+            current_time = time.time()
+            if current_time - last_telegram_send_time >= SEND_INTERVAL_SECONDS:
+                send_telegram_message(ltp_val)
     except Exception as e:
-        logging.error(f"Error in on_message handler: {e}")
+        logging.error(f"Error in on_message handler: {e}\n{traceback.format_exc()}")
 
 def on_error(instance, error):
     logging.error(f"WebSocket Error: {error}")
 
-# --- 4. Main Function (Synchronous, for OLD library) ---
+# --- 4. Diagnostic helper (prints header/ws/subscription packet if available) ---
+def log_feed_diagnostics(feed, instruments):
+    try:
+        if hasattr(feed, "ws"):
+            try:
+                logging.info("DIAG: feed.ws -> %s", getattr(feed, "ws"))
+            except Exception:
+                logging.debug("Cannot read feed.ws")
+        if hasattr(feed, "create_header") and callable(getattr(feed, "create_header")):
+            try:
+                hdr = feed.create_header()
+                logging.info("DIAG: feed.create_header() -> %s", hdr)
+            except Exception as e:
+                logging.warning("DIAG: feed.create_header() raised: %s", e)
+        if hasattr(feed, "create_subscription_packet") and callable(getattr(feed, "create_subscription_packet")):
+            try:
+                pkt = feed.create_subscription_packet(instruments)
+                logging.info("DIAG: feed.create_subscription_packet(...) -> %s", pkt)
+            except Exception as e:
+                logging.warning("DIAG: create_subscription_packet raised: %s", e)
+    except Exception:
+        logging.exception("DIAG: diagnostics failed")
+
+# --- 5. Main Function (Synchronous, for OLD library) ---
 def main():
     if not all([CLIENT_ID, ACCESS_TOKEN]):
         logging.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN.")
         return
 
     logging.info(f"Starting DhanHQ WebSocket Service for {STOCK_NAME} (Old Library Mode)...")
-    
-    # Instantiate the class WITHOUT 'feed_type'
-    feed = DhanFeed(
-        client_id=CLIENT_ID,
-        access_token=ACCESS_TOKEN,
-        instruments=instruments
-    )
 
-    # Assign callbacks as attributes
-    feed.on_connect = on_connect
-    feed.on_message = on_message
-    feed.on_error = on_error
+    # Instantiate the class WITHOUT unexpected kwargs
+    try:
+        feed = DhanFeed(client_id=CLIENT_ID, access_token=ACCESS_TOKEN, instruments=instruments)
+    except TypeError:
+        # fallback to positional
+        logging.info("Constructor kwargs failed; trying positional constructor.")
+        feed = DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments)
 
-    # Run the connection loop
-    feed.run_forever()
+    # Assign callbacks as attributes (preferred for old lib)
+    try:
+        feed.on_connect = on_connect
+    except Exception:
+        logging.debug("Could not set feed.on_connect attribute directly.")
 
-# --- 5. Entry Point ---
+    try:
+        feed.on_message = on_message
+    except Exception:
+        logging.debug("Could not set feed.on_message attribute directly.")
+
+    try:
+        feed.on_error = on_error
+    except Exception:
+        logging.debug("Could not set feed.on_error attribute directly.")
+
+    # DIAGNOSTICS before starting connection
+    log_feed_diagnostics(feed, instruments)
+
+    # FORCE common Authorization header (try both common names) — helps when create_header is wrong
+    try:
+        forced = {"Authorization": f"Bearer {ACCESS_TOKEN}", "access-token": ACCESS_TOKEN}
+        try:
+            setattr(feed, "header", forced)
+            logging.info("Set feed.header to forced Authorization header.")
+        except Exception:
+            try:
+                def _forced_create_header():
+                    return forced
+                setattr(feed, "create_header", _forced_create_header)
+                logging.info("Overrode feed.create_header to return forced Authorization header.")
+            except Exception as e:
+                logging.debug("Could not override/create header: %s", e)
+    except Exception:
+        logging.exception("Failed setting forced header")
+
+    # Try subscribing (numeric-ids fallback)
+    try:
+        # many old libs expect list of ints
+        try:
+            ids = [int(t[1]) for t in instruments]
+        except Exception:
+            ids = [t[1] for t in instruments]
+        if hasattr(feed, "subscribe_instruments") and callable(getattr(feed, "subscribe_instruments")):
+            try:
+                feed.subscribe_instruments(instruments)
+                logging.info("Called feed.subscribe_instruments(instruments)")
+            except Exception:
+                try:
+                    feed.subscribe_instruments(ids)
+                    logging.info("Called feed.subscribe_instruments(ids)")
+                except Exception as e:
+                    logging.debug("subscribe_instruments attempts failed: %s", e)
+        elif hasattr(feed, "subscribe_symbols") and callable(getattr(feed, "subscribe_symbols")):
+            try:
+                feed.subscribe_symbols(instruments)
+                logging.info("Called feed.subscribe_symbols(instruments)")
+            except Exception:
+                try:
+                    feed.subscribe_symbols(ids)
+                    logging.info("Called feed.subscribe_symbols(ids)")
+                except Exception as e:
+                    logging.debug("subscribe_symbols attempts failed: %s", e)
+        else:
+            logging.info("No subscribe_instruments/subscribe_symbols available on feed instance.")
+    except Exception:
+        logging.exception("Subscription attempt failed")
+
+    # Finally start the feed and capture handshake errors
+    try:
+        logging.info("Invoking feed.run_forever() ...")
+        feed.run_forever()
+    except Exception as e:
+        logging.critical("Critical failure when starting feed: %s", e)
+        logging.critical("Full traceback:\n%s", traceback.format_exc())
+
+# --- 6. Entry Point ---
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
         logging.info("Bot stopped by user.")
     except Exception as e:
-        logging.critical(f"A critical error occurred: {e}")
+        logging.critical(f"A critical error occurred: {e}\n{traceback.format_exc()}")
