@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DhanHQ WebSocket Alert Bot — robust autodetect version
-Includes:
- - dynamic dhanhq import handling
- - constructor-signature aware instantiation (multiple version candidates)
- - registers callbacks, authorizes and subscribes before run_forever()
- - throttled Telegram alerts
- - graceful shutdown and exponential backoff
+DhanHQ WebSocket Alert Bot — improved coroutine handling (v2)
+- Detects dhanhq feed class
+- Instantiates using multiple constructor signatures / version candidates
+- Awaits coroutine-based authorize() if needed
+- Registers callbacks safely (assigns for coroutine attributes)
+- Subscribes instruments, logs header/subscription packet for debugging HTTP 400
+- Calls run_forever() with no handler (as DhanFeed expects)
+- Sends throttled Telegram alerts on LTP updates
 """
 
 import os
@@ -16,8 +17,9 @@ import logging
 import traceback
 import inspect
 from typing import Any, Optional
-
+import asyncio
 import requests
+import signal
 
 # -----------------
 # Config / Env
@@ -129,26 +131,17 @@ def market_feed_handler(message: Any):
         logger.exception("Handler error: %s\n%s", e, traceback.format_exc())
 
 # -----------------
-# Constructor helper (simpler, robust)
+# Constructor helper
 # -----------------
 def instantiate_feed_simple(feed_class, client, token, instruments, version_candidates):
-    """
-    Simpler attempt to instantiate feed_class:
-     - try kwargs with common names
-     - try positional (client, token, instruments)
-     - try adding version kw if supported
-    Returns (instance, used_version) or (None, None)
-    """
     param_names = []
     try:
         sig = inspect.signature(feed_class)
         param_names = list(sig.parameters.keys())
         logger.debug("Constructor params: %s", param_names)
     except Exception:
-        # cannot introspect; we'll try safe positional too
         param_names = []
 
-    # common mappings
     mappings = [
         {"client_id": client, "access_token": token, "instruments": instruments},
         {"clientId": client, "access_token": token, "instruments": instruments},
@@ -156,17 +149,14 @@ def instantiate_feed_simple(feed_class, client, token, instruments, version_cand
         {"client_id": client, "token": token, "instruments": instruments},
         {"client": client, "access_token": token, "instruments": instruments},
     ]
-
     version_keys = ["version", "v", "feed_type", "feedType"]
 
     for ver in version_candidates:
-        # try mappings with kw if possible
         for kw in mappings:
             kwargs = {}
             for k, v in kw.items():
                 if not param_names or k in param_names:
                     kwargs[k] = v
-            # include version if supported
             if ver is not None:
                 for vk in version_keys:
                     if not param_names or vk in param_names:
@@ -184,12 +174,9 @@ def instantiate_feed_simple(feed_class, client, token, instruments, version_cand
             except ValueError as ve:
                 logger.warning("Constructor ValueError: %s", ve)
                 if "Unsupported version" in str(ve):
-                    # try next version candidate
                     break
             except Exception as e:
                 logger.exception("Constructor raised exception: %s", e)
-
-        # try simple positional
         try:
             if ver is None:
                 logger.info("Trying constructor positional (client, token, instruments)")
@@ -209,24 +196,21 @@ def instantiate_feed_simple(feed_class, client, token, instruments, version_cand
                 continue
         except Exception as e:
             logger.exception("Positional constructor exception: %s", e)
-
-    # final fallback: try (client, token) only
     try:
         inst = feed_class(client, token)
         logger.info("Instantiated feed via fallback (client, token).")
         return inst, None
     except Exception as e:
         logger.exception("Fallback instantiation failed: %s", e)
-
     return None, None
 
 # -----------------
-# try calling run-like methods
+# Improved try_start_feed_instance handling async coroutines
 # -----------------
 def try_start_feed_instance(feed, instruments):
     """
-    Configure callbacks / auth / subscriptions on feed BEFORE calling run_forever() (no args).
-    Returns (started_bool, error_if_any).
+    Authorize (await if coroutine), register callbacks (assign or await if needed),
+    subscribe, debug headers/packets, then call run_forever() (no args).
     """
     try:
         feed_dir = dir(feed)
@@ -235,72 +219,107 @@ def try_start_feed_instance(feed, instruments):
         logger.exception("Unable to list feed dir")
         feed_dir = []
 
-    # 1) Try to authorize if method exists
+    # Helper to run coroutine using feed.loop if present, otherwise asyncio.run()
+    def run_coro(coro):
+        try:
+            loop = getattr(feed, "loop", None)
+            if loop and isinstance(loop, asyncio.AbstractEventLoop):
+                return loop.run_until_complete(coro)
+            else:
+                return asyncio.run(coro)
+        except Exception as e:
+            logger.exception("Error running coroutine: %s", e)
+            raise
+
+    # 0) Ensure access token attribute
+    try:
+        if hasattr(feed, "access_token"):
+            try:
+                cur = getattr(feed, "access_token", None)
+                if not cur:
+                    setattr(feed, "access_token", ACCESS_TOKEN)
+                    logger.info("Set feed.access_token = ACCESS_TOKEN")
+            except Exception:
+                logger.debug("Could not set feed.access_token")
+    except Exception:
+        pass
+
+    # 1) Authorize: if coroutine function, await it; else call
     try:
         if hasattr(feed, "authorize") and callable(getattr(feed, "authorize")):
-            try:
-                # try authorize() with no args
-                feed.authorize()
-                logger.info("Called feed.authorize()")
-            except TypeError:
-                # try authorize with token
+            auth_fn = getattr(feed, "authorize")
+            if inspect.iscoroutinefunction(auth_fn):
                 try:
-                    feed.authorize(ACCESS_TOKEN)
-                    logger.info("Called feed.authorize(ACCESS_TOKEN)")
+                    run_coro(auth_fn())
+                    logger.info("Awaited feed.authorize() coroutine")
                 except Exception as e:
-                    logger.debug("feed.authorize(...) failed: %s", e)
-        elif hasattr(feed, "access_token"):
-            # set attribute if empty/missing
-            try:
-                current = getattr(feed, "access_token", None)
-                if not current:
-                    setattr(feed, "access_token", ACCESS_TOKEN)
-                    logger.info("Set feed.access_token attribute")
-            except Exception:
-                pass
+                    logger.debug("Awaiting authorize failed: %s", e)
+            else:
+                try:
+                    auth_fn()
+                    logger.info("Called feed.authorize() (sync)")
+                except TypeError:
+                    try:
+                        auth_fn(ACCESS_TOKEN)
+                        logger.info("Called feed.authorize(ACCESS_TOKEN) (sync)")
+                    except Exception as e:
+                        logger.debug("feed.authorize sync variations failed: %s", e)
     except Exception:
         logger.exception("Authorize attempt raised exception")
 
-    # 2) Register our market_feed_handler as callback on common hook names
+    # 2) Register callbacks: detect coroutine functions and assign rather than call if needed
     callback_names = ["on_ticks", "on_tick", "on_message", "on_data", "on_update", "on_connection_opened", "on_open", "on_connect"]
+    registered = False
     for name in callback_names:
         try:
             if hasattr(feed, name):
                 attr = getattr(feed, name)
-                # If it's callable (method) that probably expects a function, try to call it
-                if callable(attr):
+                if inspect.iscoroutinefunction(attr):
+                    try:
+                        setattr(feed, name, market_feed_handler)
+                        logger.info("Assigned handler to coroutine attribute feed.%s (did not call)", name)
+                        registered = True
+                    except Exception as e:
+                        logger.debug("Failed assigning handler to coroutine attr %s: %s", name, e)
+                elif callable(attr):
                     try:
                         attr(market_feed_handler)
                         logger.info("Registered handler by calling feed.%s(handler)", name)
+                        registered = True
                     except TypeError:
-                        # maybe it's meant to be assigned rather than called
                         try:
                             setattr(feed, name, market_feed_handler)
-                            logger.info("Registered handler by setting feed.%s = handler", name)
+                            logger.info("Registered handler by setting feed.%s = handler (fallback)", name)
+                            registered = True
                         except Exception as e:
                             logger.debug("Could not set attribute %s: %s", name, e)
                     except Exception as e:
                         logger.debug("Calling feed.%s raised: %s", name, e)
                 else:
-                    # not callable -> try assign
                     try:
                         setattr(feed, name, market_feed_handler)
-                        logger.info("Registered handler by setting feed.%s = handler (non-callable attr)", name)
+                        logger.info("Registered handler by setting feed.%s = handler (non-callable)", name)
+                        registered = True
                     except Exception as e:
                         logger.debug("Could not set non-callable attr %s: %s", name, e)
         except Exception:
             logger.exception("Error registering callback on %s", name)
+    if not registered:
+        logger.warning("No common callback hook found (on_ticks/on_message). feed may still push via internal handlers.")
 
-    # 3) Subscribe instruments if available
+    # 3) Subscribe instruments: try numeric id list as well
     try:
+        ids = None
+        try:
+            ids = [int(t[1]) for t in instruments]
+        except Exception:
+            ids = [t[1] for t in instruments]
         if hasattr(feed, "subscribe_instruments") and callable(getattr(feed, "subscribe_instruments")):
             try:
                 feed.subscribe_instruments(instruments)
                 logger.info("Called feed.subscribe_instruments(instruments)")
             except TypeError:
-                # maybe expects list of ids only
                 try:
-                    ids = [t[1] for t in instruments]
                     feed.subscribe_instruments(ids)
                     logger.info("Called feed.subscribe_instruments(ids)")
                 except Exception as e:
@@ -311,16 +330,22 @@ def try_start_feed_instance(feed, instruments):
                 logger.info("Called feed.subscribe_symbols(instruments)")
             except TypeError:
                 try:
-                    ids = [t[1] for t in instruments]
                     feed.subscribe_symbols(ids)
                     logger.info("Called feed.subscribe_symbols(ids)")
                 except Exception as e:
                     logger.debug("subscribe_symbols variations failed: %s", e)
+        else:
+            logger.info("No subscribe_instruments/subscribe_symbols method found.")
     except Exception:
         logger.exception("Subscription attempt raised exception")
 
-    # 4) Debug: if feed has create_header or similar, log it (helps diagnose 400)
+    # 4) Debug create_header, subscription packet and ws url
     try:
+        if hasattr(feed, "ws"):
+            try:
+                logger.info("feed.ws -> %s", getattr(feed, "ws"))
+            except Exception:
+                pass
         if hasattr(feed, "create_header") and callable(getattr(feed, "create_header")):
             try:
                 hdr = feed.create_header()
@@ -336,26 +361,51 @@ def try_start_feed_instance(feed, instruments):
     except Exception:
         logger.exception("Debug header/sub packet generation failed")
 
-    # 5) Finally call run_forever (no args). Many DhanFeed.run_forever takes no parameters.
+    # 4b) If header missing auth, try setting common Authorization header (Bearer)
+    try:
+        try:
+            hdr = None
+            if hasattr(feed, "create_header") and callable(getattr(feed, "create_header")):
+                try:
+                    hdr = feed.create_header()
+                except Exception:
+                    hdr = None
+            if not hdr or not isinstance(hdr, dict) or not any(k.lower().startswith("auth") for k in hdr.keys()):
+                forced = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+                try:
+                    setattr(feed, "header", forced)
+                    logger.info("Set feed.header to forced Authorization Bearer header")
+                except Exception:
+                    try:
+                        def _forced_create_header():
+                            return forced
+                        setattr(feed, "create_header", _forced_create_header)
+                        logger.info("Overrode feed.create_header to return Authorization Bearer header")
+                    except Exception as e:
+                        logger.debug("Could not override create_header: %s", e)
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("Forced header override failed")
+
+    # 5) Finally call run_forever (no args). If it raises InvalidStatus (HTTP 400) we log and return error
     if hasattr(feed, "run_forever") and callable(getattr(feed, "run_forever")):
         try:
-            logger.info("Attempting feed.run_forever() (no args)")
+            logger.info("Calling feed.run_forever() (no args)")
             feed.run_forever()
-            # If run_forever returns, feed stopped — we consider that an invocation (it may block)
             return True, None
         except ValueError as ve:
             logger.exception("ValueError invoking run_forever: %s", ve)
             return False, ve
         except Exception as e:
-            logger.exception("Exception invoking run_forever: %s", e)
-            # Some exceptions (like websockets InvalidStatus 400) propagate here
+            logger.exception("Exception invoking run_forever (likely ws handshake error): %s", e)
             return True, e
 
-    # 6) If no run_forever, try other available start methods without handler args
+    # fallback tries
     for alt in ("run", "start", "listen"):
         if hasattr(feed, alt) and callable(getattr(feed, alt)):
             try:
-                logger.info("Attempting feed.%s() (no args)", alt)
+                logger.info("Attempting feed.%s() (no args) as fallback", alt)
                 getattr(feed, alt)()
                 return True, None
             except Exception as e:
@@ -408,7 +458,6 @@ def start_market_feed():
     logger.info("Instruments to subscribe: %s", instruments)
 
     version_candidates = [None, "1", "v1", "v2", "2.0"]
-
     backoff = INITIAL_BACKOFF
     while True:
         try:
@@ -422,7 +471,6 @@ def start_market_feed():
                     return
                 logger.info("Feed instance created (used_version=%s). type=%s", used_version, type(feed))
             else:
-                # fallback: module-level function
                 if hasattr(module_obj, "market_feed_wss"):
                     try:
                         logger.info("Trying module_obj.market_feed_wss(...) fallback")
@@ -438,7 +486,6 @@ def start_market_feed():
                 logger.error("No feed_class and no working module-level fallback.")
                 return
 
-            # try to start the feed instance
             started, err = try_start_feed_instance(feed, instruments)
             if started:
                 if isinstance(err, ValueError) and "Unsupported version" in str(err):
@@ -452,7 +499,6 @@ def start_market_feed():
                         pass
                     time.sleep(0.5)
                     continue
-                # else: feed invoked (may block). when it returns we'll reconnect (loop)
                 backoff = INITIAL_BACKOFF
                 time.sleep(1)
                 continue
@@ -474,7 +520,6 @@ def start_market_feed():
 # -----------------
 # Signals
 # -----------------
-import signal
 def _signal_handler(sig, frame):
     logger.info("Signal %s received; exiting.", sig)
     raise SystemExit()
