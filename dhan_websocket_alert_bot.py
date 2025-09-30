@@ -1,9 +1,7 @@
-
 import os
 import time
 import requests
 import logging
-import asyncio
 
 from dhanhq import DhanFeed
 from dhanhq.marketfeed import NSE
@@ -14,7 +12,7 @@ ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-STOCK_ID = '1333'  # HDFC Bank Security ID
+STOCK_ID = '1333'
 STOCK_NAME = "HDFCBANK"
 SEND_INTERVAL_SECONDS = 60
 
@@ -26,6 +24,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- 2. Telegram Function ---
 def send_telegram_message(ltp_price):
     global last_telegram_send_time
+    # ... (This function remains the same)
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S IST")
     message = (
         f"🔔 *{STOCK_NAME} LTP ALERT!* 🔔\n\n"
@@ -44,14 +43,14 @@ def send_telegram_message(ltp_price):
         logging.error(f"Error sending Telegram message: {e}")
 
 # --- 3. WebSocket Callback Functions ---
-# NOTE: The library passes the instance as the first argument to callbacks
 def on_connect(instance):
-    logging.info("WebSocket V2 Feed Connected Successfully!")
+    logging.info("WebSocket Connected (Old Library Version).")
 
 def on_message(instance, message):
     try:
-        if message.get('feed_code') == 'Ticker' and message.get('security_id') == STOCK_ID:
-            ltp = message.get('ltp')
+        # Assuming old message format
+        if message.get('securityId') == STOCK_ID and message.get('lastTradedPrice'):
+            ltp = message.get('lastTradedPrice')
             if ltp is not None:
                 current_time = time.time()
                 if current_time - last_telegram_send_time >= SEND_INTERVAL_SECONDS:
@@ -62,34 +61,33 @@ def on_message(instance, message):
 def on_error(instance, error):
     logging.error(f"WebSocket Error: {error}")
 
-# --- 4. Main Asynchronous Function ---
-async def main():
+# --- 4. Main Function (Synchronous, for OLD library) ---
+def main():
     if not all([CLIENT_ID, ACCESS_TOKEN]):
         logging.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN.")
         return
 
-    logging.info(f"Starting DhanHQ WebSocket Service for {STOCK_NAME}...")
+    logging.info(f"Starting DhanHQ WebSocket Service for {STOCK_NAME} (Old Library Mode)...")
     
-    # Step 1: Instantiate the class WITHOUT callback arguments
+    # Instantiate the class WITHOUT 'feed_type'
     feed = DhanFeed(
         client_id=CLIENT_ID,
         access_token=ACCESS_TOKEN,
-        instruments=instruments,
-        feed_type='v2'
+        instruments=instruments
     )
 
-    # Step 2: Assign the callback functions as attributes AFTER creating the object
+    # Assign callbacks as attributes
     feed.on_connect = on_connect
     feed.on_message = on_message
     feed.on_error = on_error
 
-    # Step 3: Run the connection loop
-    await feed.run_forever()
+    # Run the connection loop
+    feed.run_forever()
 
 # --- 5. Entry Point ---
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         logging.info("Bot stopped by user.")
     except Exception as e:
