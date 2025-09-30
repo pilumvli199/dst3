@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DhanHQ WebSocket Alert Bot — improved coroutine handling (v2)
-- Detects dhanhq feed class
-- Instantiates using multiple constructor signatures / version candidates
-- Awaits coroutine-based authorize() if needed
-- Registers callbacks safely (assigns for coroutine attributes)
-- Subscribes instruments, logs header/subscription packet for debugging HTTP 400
-- Calls run_forever() with no handler (as DhanFeed expects)
-- Sends throttled Telegram alerts on LTP updates
+dhan_websocket_alert_bot.py — updated robust version
+- coroutine-aware authorize & callback handling
+- forced Authorization header fallback
+- numeric-id subscription fallback
+- diagnostic logs for create_header / create_subscription_packet / ws
+- throttled Telegram alerts for LTP
 """
 
 import os
@@ -18,8 +16,9 @@ import traceback
 import inspect
 from typing import Any, Optional
 import asyncio
-import requests
 import signal
+
+import requests
 
 # -----------------
 # Config / Env
@@ -224,6 +223,7 @@ def try_start_feed_instance(feed, instruments):
         try:
             loop = getattr(feed, "loop", None)
             if loop and isinstance(loop, asyncio.AbstractEventLoop):
+                # Use feed.loop if present in library
                 return loop.run_until_complete(coro)
             else:
                 return asyncio.run(coro)
@@ -231,7 +231,7 @@ def try_start_feed_instance(feed, instruments):
             logger.exception("Error running coroutine: %s", e)
             raise
 
-    # 0) Ensure access token attribute
+    # 0) Ensure access token attribute if present
     try:
         if hasattr(feed, "access_token"):
             try:
@@ -244,7 +244,7 @@ def try_start_feed_instance(feed, instruments):
     except Exception:
         pass
 
-    # 1) Authorize: if coroutine function, await it; else call
+    # 1) Authorize: if coroutine function, await it; else call sync
     try:
         if hasattr(feed, "authorize") and callable(getattr(feed, "authorize")):
             auth_fn = getattr(feed, "authorize")
@@ -267,7 +267,7 @@ def try_start_feed_instance(feed, instruments):
     except Exception:
         logger.exception("Authorize attempt raised exception")
 
-    # 2) Register callbacks: detect coroutine functions and assign rather than call if needed
+    # 2) Register callbacks: detect coroutine attributes and assign handler rather than calling
     callback_names = ["on_ticks", "on_tick", "on_message", "on_data", "on_update", "on_connection_opened", "on_open", "on_connect"]
     registered = False
     for name in callback_names:
@@ -275,6 +275,7 @@ def try_start_feed_instance(feed, instruments):
             if hasattr(feed, name):
                 attr = getattr(feed, name)
                 if inspect.iscoroutinefunction(attr):
+                    # attribute is coroutine function - assign handler instead of calling
                     try:
                         setattr(feed, name, market_feed_handler)
                         logger.info("Assigned handler to coroutine attribute feed.%s (did not call)", name)
@@ -307,7 +308,7 @@ def try_start_feed_instance(feed, instruments):
     if not registered:
         logger.warning("No common callback hook found (on_ticks/on_message). feed may still push via internal handlers.")
 
-    # 3) Subscribe instruments: try numeric id list as well
+    # 3) Subscribe instruments: try tuple-list, else numeric ids
     try:
         ids = None
         try:
@@ -316,6 +317,7 @@ def try_start_feed_instance(feed, instruments):
             ids = [t[1] for t in instruments]
         if hasattr(feed, "subscribe_instruments") and callable(getattr(feed, "subscribe_instruments")):
             try:
+                # try the original instruments (tuples) first
                 feed.subscribe_instruments(instruments)
                 logger.info("Called feed.subscribe_instruments(instruments)")
             except TypeError:
@@ -371,7 +373,7 @@ def try_start_feed_instance(feed, instruments):
                 except Exception:
                     hdr = None
             if not hdr or not isinstance(hdr, dict) or not any(k.lower().startswith("auth") for k in hdr.keys()):
-                forced = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+                forced = {"Authorization": f"Bearer {ACCESS_TOKEN}", "access-token": ACCESS_TOKEN}
                 try:
                     setattr(feed, "header", forced)
                     logger.info("Set feed.header to forced Authorization Bearer header")
@@ -393,6 +395,7 @@ def try_start_feed_instance(feed, instruments):
         try:
             logger.info("Calling feed.run_forever() (no args)")
             feed.run_forever()
+            # when run_forever returns, treat as invoked/stopped
             return True, None
         except ValueError as ve:
             logger.exception("ValueError invoking run_forever: %s", ve)
@@ -401,7 +404,7 @@ def try_start_feed_instance(feed, instruments):
             logger.exception("Exception invoking run_forever (likely ws handshake error): %s", e)
             return True, e
 
-    # fallback tries
+    # fallback attempts
     for alt in ("run", "start", "listen"):
         if hasattr(feed, alt) and callable(getattr(feed, alt)):
             try:
