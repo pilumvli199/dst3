@@ -1,3 +1,4 @@
+
 import os
 import time
 import requests
@@ -43,6 +44,7 @@ def send_telegram_message(ltp_price):
         logging.error(f"Error sending Telegram message: {e}")
 
 # --- 3. WebSocket Callback Functions ---
+# NOTE: The library passes the instance as the first argument to callbacks
 def on_connect(instance):
     logging.info("WebSocket V2 Feed Connected Successfully!")
 
@@ -68,19 +70,20 @@ async def main():
 
     logging.info(f"Starting DhanHQ WebSocket Service for {STOCK_NAME}...")
     
-    # This is the correct way to instantiate the feed for the new library.
-    # The library will handle authorization automatically after connecting.
+    # Step 1: Instantiate the class WITHOUT callback arguments
     feed = DhanFeed(
         client_id=CLIENT_ID,
         access_token=ACCESS_TOKEN,
         instruments=instruments,
-        on_connect=on_connect,
-        on_message=on_message,
-        on_error=on_error,
         feed_type='v2'
     )
 
-    # This will connect, authorize, and run forever.
+    # Step 2: Assign the callback functions as attributes AFTER creating the object
+    feed.on_connect = on_connect
+    feed.on_message = on_message
+    feed.on_error = on_error
+
+    # Step 3: Run the connection loop
     await feed.run_forever()
 
 # --- 5. Entry Point ---
