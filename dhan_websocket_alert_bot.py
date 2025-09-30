@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Old-library mode DhanHQ WebSocket Bot — diagnostic main (full file)
-- Tries create_header/create_subscription_packet with candidate feed_request_codes
-- Forces Authorization header fallback
-- Subscribes with numeric-id fallback
-- Starts feed.run_forever() and logs full traceback on HTTP 400
+dhan_websocket_alert_bot.py — OLD-LIB mode with authorize-await before connect
+- Calls feed.authorize() and awaits if coroutine
+- Then runs diagnostics (create_header/create_subscription_packet)
+- Then attempts subscribe and run_forever()
 """
 
 import os
@@ -13,6 +12,8 @@ import time
 import requests
 import logging
 import traceback
+import inspect
+import asyncio
 
 from dhanhq import DhanFeed
 from dhanhq.marketfeed import NSE
@@ -32,7 +33,7 @@ instruments = [(NSE, STOCK_ID)]
 last_telegram_send_time = time.time()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 2. Telegram Function ---
+# --- Telegram helper (same as before) ---
 def send_telegram_message(ltp_price):
     global last_telegram_send_time
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S IST")
@@ -61,12 +62,10 @@ def on_connect(instance=None):
 
 def on_message(instance, message):
     try:
-        # message may be dict or object depending on library version
         if isinstance(message, dict):
             sec = message.get('securityId') or message.get('symbol') or message.get('s')
             ltp = message.get('lastTradedPrice') or message.get('ltp')
         else:
-            # try attribute access
             sec = getattr(message, 'securityId', None) or getattr(message, 'symbol', None)
             ltp = getattr(message, 'lastTradedPrice', None) or getattr(message, 'ltp', None)
 
@@ -84,7 +83,7 @@ def on_message(instance, message):
 def on_error(instance, error):
     logging.error(f"WebSocket Error: {error}")
 
-# --- 4. Diagnostic helper (prints header/ws/subscription packet if available) ---
+# --- Diagnostic helper ---
 def log_feed_diagnostics(feed, instruments):
     try:
         if hasattr(feed, "ws"):
@@ -93,28 +92,29 @@ def log_feed_diagnostics(feed, instruments):
             except Exception:
                 logging.debug("Cannot read feed.ws")
         if hasattr(feed, "create_header") and callable(getattr(feed, "create_header")):
-            try:
-                # Don't call without args here; will be tried in the diagnostic block
-                logging.info("DIAG: feed.create_header() is callable (requires args).")
-            except Exception as e:
-                logging.warning("DIAG: feed.create_header() raised: %s", e)
+            logging.info("DIAG: feed.create_header() is callable (requires args).")
         if hasattr(feed, "create_subscription_packet") and callable(getattr(feed, "create_subscription_packet")):
-            try:
-                logging.info("DIAG: feed.create_subscription_packet() is callable (requires args).")
-            except Exception as e:
-                logging.warning("DIAG: create_subscription_packet info: %s", e)
+            logging.info("DIAG: feed.create_subscription_packet() is callable (requires args).")
     except Exception:
         logging.exception("DIAG: diagnostics failed")
 
-# --- 5. Main Function (Synchronous, for OLD library) ---
+# --- Helper to run coroutine with feed.loop if available, otherwise asyncio.run ---
+def run_coro_on_feed(feed, coro):
+    loop = getattr(feed, "loop", None)
+    if loop and isinstance(loop, asyncio.AbstractEventLoop):
+        return loop.run_until_complete(coro)
+    else:
+        return asyncio.run(coro)
+
+# --- Main function with explicit authorize-await before connect ---
 def main():
     if not all([CLIENT_ID, ACCESS_TOKEN]):
         logging.error("Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN.")
         return
 
-    logging.info(f"Starting DhanHQ WebSocket Service for {STOCK_NAME} (Old Library Mode)...")
+    logging.info(f"Starting DhanHQ WebSocket Service for {STOCK_NAME} (Old Library Mode) with authorize step...")
 
-    # Instantiate the class WITHOUT unexpected kwargs
+    # instantiate
     try:
         feed = DhanFeed(client_id=CLIENT_ID, access_token=ACCESS_TOKEN, instruments=instruments)
     except Exception as e:
@@ -122,42 +122,71 @@ def main():
         try:
             feed = DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments)
         except Exception as ex:
-            logging.critical("Failed to instantiate DhanFeed via positional constructor: %s", ex)
+            logging.critical("Failed to instantiate DhanFeed: %s", ex)
             logging.critical("Traceback:\n%s", traceback.format_exc())
             return
 
-    # Assign callbacks as attributes (preferred for old lib)
+    # set callbacks
     try:
         feed.on_connect = on_connect
     except Exception:
         logging.debug("Could not set feed.on_connect attribute directly.")
-
     try:
         feed.on_message = on_message
     except Exception:
         logging.debug("Could not set feed.on_message attribute directly.")
-
     try:
         feed.on_error = on_error
     except Exception:
         logging.debug("Could not set feed.on_error attribute directly.")
 
-    # DIAGNOSTICS before starting connection
+    # --- IMPORTANT: AUTHORIZE (await if coroutine) ---
+    try:
+        if hasattr(feed, "authorize") and callable(getattr(feed, "authorize")):
+            auth_fn = getattr(feed, "authorize")
+            if inspect.iscoroutinefunction(auth_fn):
+                logging.info("authorize() is coroutine — awaiting it now...")
+                try:
+                    run_coro_on_feed(feed, auth_fn())
+                    logging.info("feed.authorize() awaited successfully.")
+                except Exception as e:
+                    logging.exception("feed.authorize() coroutine raised: %s", e)
+            else:
+                try:
+                    auth_fn()
+                    logging.info("feed.authorize() called (sync).")
+                except TypeError:
+                    try:
+                        auth_fn(ACCESS_TOKEN)
+                        logging.info("feed.authorize(ACCESS_TOKEN) called (sync).")
+                    except Exception as e:
+                        logging.debug("feed.authorize sync variants failed: %s", e)
+    except Exception:
+        logging.exception("Authorize attempt raised exception")
+
+    # diagnostics AFTER authorize
     log_feed_diagnostics(feed, instruments)
 
     # --- DIAGNOSTIC: try create_header / create_subscription_packet with candidate feed_request_codes ---
     try:
-        candidate_codes = [1, 2, 3, 4, 10]   # काही सामान्य संभाव्य कोड — विस्तार करून चालवता येईल
+        candidate_codes = [1, 2, 3, 4, 10]
         for code in candidate_codes:
             try:
-                # message_length: often 0 or small int for initial handshake; try 0, 128, 1024
                 for mlen in (0, 128, 1024):
                     try:
-                        hdr = feed.create_header(code, mlen, CLIENT_ID)
-                        logging.info("DIAG: create_header(code=%s, mlen=%s, client_id=%s) -> %s", code, mlen, CLIENT_ID, hdr)
+                        hdr = None
+                        try:
+                            hdr = feed.create_header(code, mlen, CLIENT_ID)
+                        except TypeError as te:
+                            # some libs accept client_id as int or str; try both forms
+                            try:
+                                hdr = feed.create_header(code, mlen, str(CLIENT_ID))
+                            except Exception:
+                                hdr = None
+                        if hdr is not None:
+                            logging.info("DIAG: create_header(code=%s, mlen=%s, client_id=%s) -> %s", code, mlen, CLIENT_ID, hdr)
                     except Exception as e:
                         logging.debug("DIAG: create_header(code=%s, mlen=%s) failed: %s", code, mlen, str(e))
-                # try create_subscription_packet if available
                 if hasattr(feed, "create_subscription_packet") and callable(getattr(feed, "create_subscription_packet")):
                     try:
                         pkt = feed.create_subscription_packet(code)
@@ -169,7 +198,10 @@ def main():
     except Exception:
         logging.exception("DIAG: create_header/create_subscription_packet diagnostic block failed")
 
-    # FORCE common Authorization header (try both common names) — helps when create_header is wrong
+    # If create_header produced usable bytes for any code, we CAN set feed.header or override create_header.
+    # (But often these bytes are low-level handshake packets expected to be sent AFTER the websocket is opened,
+    #  not as HTTP headers. The library handles that—so forcing HTTP Authorization header is often not sufficient.)
+    # Still try a conservative override for HTTP header if server expects it:
     try:
         forced = {"Authorization": f"Bearer {ACCESS_TOKEN}", "access-token": ACCESS_TOKEN}
         try:
@@ -225,7 +257,7 @@ def main():
         logging.critical("Critical failure when starting feed: %s", e)
         logging.critical("Full traceback:\n%s", traceback.format_exc())
 
-# --- 6. Entry Point ---
+# Entry point
 if __name__ == "__main__":
     try:
         main()
