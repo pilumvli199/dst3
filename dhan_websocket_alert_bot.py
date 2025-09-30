@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Old-library mode DhanHQ WebSocket Bot — with forced headers + diagnostics
+Old-library mode DhanHQ WebSocket Bot — diagnostic main (full file)
+- Tries create_header/create_subscription_packet with candidate feed_request_codes
+- Forces Authorization header fallback
+- Subscribes with numeric-id fallback
+- Starts feed.run_forever() and logs full traceback on HTTP 400
 """
 
 import os
@@ -90,16 +94,15 @@ def log_feed_diagnostics(feed, instruments):
                 logging.debug("Cannot read feed.ws")
         if hasattr(feed, "create_header") and callable(getattr(feed, "create_header")):
             try:
-                hdr = feed.create_header()
-                logging.info("DIAG: feed.create_header() -> %s", hdr)
+                # Don't call without args here; will be tried in the diagnostic block
+                logging.info("DIAG: feed.create_header() is callable (requires args).")
             except Exception as e:
                 logging.warning("DIAG: feed.create_header() raised: %s", e)
         if hasattr(feed, "create_subscription_packet") and callable(getattr(feed, "create_subscription_packet")):
             try:
-                pkt = feed.create_subscription_packet(instruments)
-                logging.info("DIAG: feed.create_subscription_packet(...) -> %s", pkt)
+                logging.info("DIAG: feed.create_subscription_packet() is callable (requires args).")
             except Exception as e:
-                logging.warning("DIAG: create_subscription_packet raised: %s", e)
+                logging.warning("DIAG: create_subscription_packet info: %s", e)
     except Exception:
         logging.exception("DIAG: diagnostics failed")
 
@@ -114,10 +117,14 @@ def main():
     # Instantiate the class WITHOUT unexpected kwargs
     try:
         feed = DhanFeed(client_id=CLIENT_ID, access_token=ACCESS_TOKEN, instruments=instruments)
-    except TypeError:
-        # fallback to positional
-        logging.info("Constructor kwargs failed; trying positional constructor.")
-        feed = DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments)
+    except Exception as e:
+        logging.warning("Constructor kwargs failed or raised exception (%s); trying positional constructor.", e)
+        try:
+            feed = DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments)
+        except Exception as ex:
+            logging.critical("Failed to instantiate DhanFeed via positional constructor: %s", ex)
+            logging.critical("Traceback:\n%s", traceback.format_exc())
+            return
 
     # Assign callbacks as attributes (preferred for old lib)
     try:
@@ -138,6 +145,30 @@ def main():
     # DIAGNOSTICS before starting connection
     log_feed_diagnostics(feed, instruments)
 
+    # --- DIAGNOSTIC: try create_header / create_subscription_packet with candidate feed_request_codes ---
+    try:
+        candidate_codes = [1, 2, 3, 4, 10]   # काही सामान्य संभाव्य कोड — विस्तार करून चालवता येईल
+        for code in candidate_codes:
+            try:
+                # message_length: often 0 or small int for initial handshake; try 0, 128, 1024
+                for mlen in (0, 128, 1024):
+                    try:
+                        hdr = feed.create_header(code, mlen, CLIENT_ID)
+                        logging.info("DIAG: create_header(code=%s, mlen=%s, client_id=%s) -> %s", code, mlen, CLIENT_ID, hdr)
+                    except Exception as e:
+                        logging.debug("DIAG: create_header(code=%s, mlen=%s) failed: %s", code, mlen, str(e))
+                # try create_subscription_packet if available
+                if hasattr(feed, "create_subscription_packet") and callable(getattr(feed, "create_subscription_packet")):
+                    try:
+                        pkt = feed.create_subscription_packet(code)
+                        logging.info("DIAG: create_subscription_packet(code=%s) -> %s", code, pkt)
+                    except Exception as e:
+                        logging.debug("DIAG: create_subscription_packet(code=%s) failed: %s", code, str(e))
+            except Exception:
+                logging.exception("DIAG: inner loop failure for code %s", code)
+    except Exception:
+        logging.exception("DIAG: create_header/create_subscription_packet diagnostic block failed")
+
     # FORCE common Authorization header (try both common names) — helps when create_header is wrong
     try:
         forced = {"Authorization": f"Bearer {ACCESS_TOKEN}", "access-token": ACCESS_TOKEN}
@@ -157,7 +188,6 @@ def main():
 
     # Try subscribing (numeric-ids fallback)
     try:
-        # many old libs expect list of ints
         try:
             ids = [int(t[1]) for t in instruments]
         except Exception:
